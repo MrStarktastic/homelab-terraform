@@ -18,11 +18,6 @@ locals {
   ]
 }
 
-# master_nodes[0] carries etcd. Its virtio0 zvol has sync=disabled applied by
-# hand on the Proxmox host to keep etcd WAL fsync under the leader-election
-# budget; recreating this VM provisions a fresh zvol that inherits the pool
-# default and silently reintroduces the control-plane crash loop. See the
-# "etcd Storage — ZFS Sync Tuning" section in README.md before destroying it.
 module "master_nodes" {
   source = "./modules/vm"
   count  = var.master_count
