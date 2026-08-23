@@ -113,6 +113,64 @@ The module supports:
 | **Storage** | Virtio disks with IOThread, TRIM/discard, configurable pools |
 | **Tagging** | Proxmox tags for Ansible dynamic inventory discovery |
 
+### etcd Storage — ZFS Sync Tuning
+
+> [!IMPORTANT]
+> `master_nodes[0]` carries etcd, and its OS disk is provisioned here. **Recreating that VM resets a
+> hand-applied ZFS property that the cluster's stability currently depends on.** Read this before
+> tainting or destroying a master.
+
+etcd fsyncs every write to its WAL before acknowledging it, so the control plane is the most
+sync-write-sensitive workload on the host. `os_storage` (`vm-pool`) is a single-vdev consumer NVMe
+with **no SLOG and no power-loss protection**, so every ZIL commit queues behind normal pool I/O on
+the same vdev. `zpool iostat -vl` located it precisely:
+
+| Metric | Value | Meaning |
+|--------|-------|---------|
+| write `disk_wait` | ~970 µs | the drive servicing the write — never the bottleneck |
+| write `syncq_wait` | **~24 ms** | ZIL commits queueing on the sole pool vdev — the actual problem |
+
+That latency reached etcd directly. k3s exits by design when `kube-controller-manager`,
+`kube-scheduler` or the cloud controller manager lose their 5 s leader-election lease — it did so
+**29 times in 15 days**, each one a ~33 s API outage.
+
+Setting `sync=disabled` on the master's zvol, measured over identical 60 s windows:
+
+| `sync` | etcd WAL fsync mean | backend commit mean |
+|--------|--------------------|---------------------|
+| `standard` | 4.55 ms | 4.54 ms |
+| `disabled` | **0.572 ms** | **0.856 ms** |
+
+Applied manually on the Proxmox host:
+
+```bash
+zfs set sync=disabled vm-pool/vm-200-disk-0    # <os_storage>/vm-<vm_id>-disk-0
+```
+
+> [!WARNING]
+> **This is a deliberate, temporary durability trade.** ZFS acknowledges sync writes from memory.
+> The pool stays consistent regardless, but a host kernel panic can lose the last ~5 s of etcd
+> writes. A UPS covers power loss; it does not cover a panic.
+
+**Recreating the master undoes this.** Terraform provisions `virtio0` on `os_storage`, so a
+destroyed VM gets a fresh zvol that inherits the pool default (`sync=standard`). The symptom is not
+immediate — etcd degrades over hours until the control plane starts dropping its lease. After any
+rebuild of `master_nodes[0]`, either re-apply the command above or confirm a SLOG is installed.
+
+**The permanent fix** is a SLOG with power-loss protection, which moves ZIL commits off the pool
+vdev and restores full durability — an Intel Optane P1600X 58 GB (~$30–50) is the usual choice:
+~10 µs sync latency, real PLP, non-destructive and removable. A consumer NVMe with DRAM is **not**
+a substitute; DRAM speeds up mapping tables, only PLP makes `fsync` fast.
+
+```bash
+zpool add vm-pool log /dev/disk/by-id/<slog-device>
+zfs set sync=standard vm-pool/vm-200-disk-0
+```
+
+Re-measure before calling it done. Expect roughly 1 ms rather than 0.572 ms — that residual is this
+VM's floor (virtio round-trip, `cache=none` O_DIRECT, and a 16 K `volblocksize` read-modify-write),
+not the SLOG underperforming.
+
 ---
 
 ## Packer Integration
