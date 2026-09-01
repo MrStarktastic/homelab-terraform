@@ -146,14 +146,19 @@ jobs:
             fi
           done
 
+          for node in $WORKERS $MASTERS; do
+            echo "⏸️ Cordoning $node..."
+            kubectl cordon "$node"
+          done
+
           for node in $WORKERS; do
             echo "🔄 Draining worker $node..."
-            kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --timeout=120s
+            kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --disable-eviction --timeout=120s
           done
 
           for node in $MASTERS; do
             echo "🔄 Draining master $node..."
-            kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --timeout=120s
+            kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --disable-eviction --timeout=120s
           done
 
   apply:
