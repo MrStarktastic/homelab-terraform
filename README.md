@@ -59,8 +59,8 @@ Every node is dual-homed across two isolated networks:
 
 | Network | Bridge | CIDR | Gateway | Purpose |
 |---------|--------|------|---------|---------|
-| **Management** | `vmbr0` | `10.9.9.0/24` | `10.9.9.1` | SSH, Kubernetes API, Kube-VIP HA |
-| **Services** | `vmbr1` | `10.9.8.0/24` | — | Pod overlay (Flannel), NFS, LoadBalancer traffic |
+| **Management** | `vmbr0` | `10.9.9.0/24` | — | SSH, Kubernetes API, Kube-VIP HA |
+| **Services** | `vmbr1` | `10.9.8.0/24` | `10.9.8.1` | Default Internet egress, Pod overlay (Flannel), NFS, LoadBalancer traffic |
 
 IP addresses are computed deterministically from a base CIDR and offset:
 
