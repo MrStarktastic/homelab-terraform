@@ -38,7 +38,7 @@ No Terraform resources, routes, OPNsense settings, Ansible roles, Kubernetes wor
 - Run the repository's existing formatting checks and workflow CI.
 - Require the follow-up PR plan to remain `0 add, 3 change, 0 destroy`, with only the approved `ipconfig0` and `ipconfig1` updates.
 - After merge, confirm workers drain before the control-plane node, all nodes return Ready and schedulable, and each host uses `default via 10.9.8.1 dev eth1`.
-- Confirm new qBittorrent egress is SNATed from `10.9.8.51` and matches OPNsense's MAIN `WAN_BALANCE` rule.
+- Confirm new qBittorrent egress is SNATed from its scheduled worker's MAIN address (`10.9.8.51` or `10.9.8.52`) and matches OPNsense's MAIN `WAN_BALANCE` rule.
 
 ## Rollback
 
