@@ -139,7 +139,7 @@ jobs:
           MASTERS=""
           WORKERS=""
           for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
-            if kubectl get node "$node" -o jsonpath='{.metadata.labels}' | grep -q '"node-role.kubernetes.io/master"'; then
+            if kubectl get node "$node" -o jsonpath='{.metadata.labels}' | grep -qE '"node-role.kubernetes.io/(master|control-plane)"'; then
               MASTERS="$MASTERS $node"
             else
               WORKERS="$WORKERS $node"
@@ -257,8 +257,17 @@ jobs:
           echo "${{ secrets.KUBECONFIG_RAW }}" > /tmp/kubeconfig
           chmod 600 /tmp/kubeconfig
 
-      - name: Wait for nodes to be ready
-        run: kubectl wait --for=condition=Ready nodes --all --timeout=300s
+      - name: Wait for Kubernetes API
+        run: |
+          attempts=0
+          until kubectl get nodes >/dev/null 2>&1; do
+            attempts=$((attempts + 1))
+            if [ "$attempts" -ge 60 ]; then
+              echo "Kubernetes API did not recover within 300 seconds."
+              exit 1
+            fi
+            sleep 5
+          done
 
       - name: Uncordon all nodes
         run: |
@@ -266,6 +275,9 @@ jobs:
             echo "✅ Uncordoning $node..."
             kubectl uncordon "$node"
           done
+
+      - name: Wait for nodes to be ready
+        run: kubectl wait --for=condition=Ready nodes --all --timeout=300s
 
   trigger-ansible:
     name: Trigger Ansible deployment
