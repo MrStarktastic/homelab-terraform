@@ -50,9 +50,9 @@ python:3.13-slim@sha256:cc9dffa47c8294ba9bb795a8dfaeb7b76f2b30acade2c52a461a2999
 ## Prerequisites and two-repository dependency
 
 - This Terraform branch **and** the companion Ansible PR/check-out containing
-  `canaries/iscsi-rebuild.yml` are required. Missing that entry point fails before
-  any infrastructure mutation. Do not substitute the production playbook or
-  skip-tags.
+  `canaries/iscsi-rebuild.yml` and `canaries/ansible.cfg` are required. Missing
+  either fails before any initial/rebuild infrastructure mutation. Do not
+  substitute the production playbook/config or skip-tags.
 - Local Python 3.11+, Terraform, Helm 3, kubectl and Ansible, with the Ansible
   checkout's required collections available in system collection paths. The
   caller intentionally isolates HOME and does not consume user Ansible config.
@@ -88,10 +88,23 @@ The Ansible invocation uses an explicit JSON inventory with one host in
 `canary_node_name`, `canary_iscsi_iqn`, absolute `canary_state_dir`,
 `k3s_version: v1.36.4+k3s1` and `flannel_iface` (normally `eth1`), plus explicit
 SSH host/user/key and strict generation-specific known_hosts. The play exports
-`kubeconfig` and `node-identity.json` (`machine_id`, `boot_id`) into that directory.
+`kubeconfig` and `node-identity.json` into that directory, both mode 0600. The
+identity export has four string fields: `fixture_id`, `node_name`, `machine_id`
+(32 lowercase hex characters) and `boot_id` (UUID). The caller validates the
+fixture/node names and machine/boot formats. It creates the canonical,
+operator-owned, mode 0700 generation directory before starting Ansible.
 Its API endpoint must be `https://<management-IP>:6443` with a valid certificate.
 Isolated pod/service networks are `10.242.0.0/16`, `10.243.0.0/16`, with DNS
 `10.243.0.10`; no kube-vip or production bootstrap is used.
+
+The caller selects **`<ansible_checkout>/canaries/ansible.cfg`** through
+`ANSIBLE_CONFIG`, never the repository-root configuration that selects production
+vault credentials. It sends no `KUBECONFIG`, vault-password/identity variables,
+`ANSIBLE_VARS_ENABLED`, `ANSIBLE_INVENTORY` or `ANSIBLE_ROLES_PATH` override to the
+Ansible process; the companion config controls those settings. Its guard refuses
+to write the currently selected KUBECONFIG, even an earlier canary file.
+After Ansible completes, kubectl/Helm use the explicit generation kubeconfig.
+SSH connection reuse stays disabled through the synthetic inventory.
 
 ## Private configuration and TLS
 

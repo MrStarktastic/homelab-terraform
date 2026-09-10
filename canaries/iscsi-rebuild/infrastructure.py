@@ -106,6 +106,16 @@ def ssh_public_key(text):
     return " ".join(parts[:2])
 
 
+def ansible_files(checkout):
+    paths = []
+    for filename, description in (("iscsi-rebuild.yml", "entry point"), ("ansible.cfg", "config")):
+        path = checkout / "canaries" / filename
+        if not path.is_file():
+            raise CanaryError(f"dependent Ansible canary {description} is missing")
+        paths.append(checked_path(str(path)))
+    return paths
+
+
 def validate_config(value, *, require_ansible=True):
     required = {
         "fixture_id", "vm_id", "target_node", "template_name", "management_cidr",
@@ -162,8 +172,8 @@ def validate_config(value, *, require_ansible=True):
     ssh_public_key(checked_path(config["ssh_public_key_file"]).read_text())
     checked_path(config["ssh_private_key_file"], private=True)
     checkout = checked_path(config["ansible_checkout"], directory=True)
-    if require_ansible and not (checkout / "canaries" / "iscsi-rebuild.yml").is_file():
-        raise CanaryError("dependent Ansible canary entry point is missing")
+    if require_ansible:
+        ansible_files(checkout)
     config.setdefault("proxmox_ca_file", None)
     if config["proxmox_ca_file"] is not None:
         checked_path(config["proxmox_ca_file"])
@@ -364,10 +374,12 @@ class Runner:
         }
 
     def run(self, argv, *, input_text=None, env=None, timeout=900):
+        # A None override removes a key for tools which must not inherit it.
+        child_env = {key: value for key, value in (self.env | (env or {})).items() if value is not None}
         try:
             result = subprocess.run(
                 list(argv), input=input_text, text=True, capture_output=True,
-                cwd=ROOT, env=self.env | (env or {}), timeout=timeout, check=False,
+                cwd=ROOT, env=child_env, timeout=timeout, check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             raise CanaryError(f"{Path(argv[0]).name} could not finish; command output suppressed") from None
@@ -391,6 +403,7 @@ def ansible_inputs(config, runner, initiator_iqn):
         "ansible_host": str(ipaddress.ip_interface(config["management_cidr"]).ip),
         "ansible_user": config["ciuser"],
         "ansible_ssh_private_key_file": config["ssh_private_key_file"],
+        "ansible_ssh_args": "-o ControlMaster=no -o ControlPath=none -o ControlPersist=no",
         "ansible_ssh_common_args": (
             "-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
             f"-o UserKnownHostsFile={runner.generation / 'known_hosts'} "
@@ -508,9 +521,7 @@ def validate_kubeconfig(value, config):
 
 def initialize_ansible(config, runner, api, initiator_iqn, expected_vm):
     checkout = checked_path(config["ansible_checkout"], directory=True)
-    entrypoint = checkout / "canaries" / "iscsi-rebuild.yml"
-    if not entrypoint.is_file():
-        raise CanaryError("dependent Ansible canary entry point is missing")
+    entrypoint, ansible_config = ansible_files(checkout)
     if api.owned_vm(config) != expected_vm:
         raise CanaryError("VM identity changed before Ansible host-key preflight")
     api.pin_host_key(config, runner.generation)
@@ -519,20 +530,14 @@ def initialize_ansible(config, runner, api, initiator_iqn, expected_vm):
     inventory, variables = ansible_inputs(config, runner, initiator_iqn)
     inventory_file = runner.generation / "inventory.json"
     variables_file = runner.generation / "ansible-vars.json"
-    ansible_config = runner.generation / "ansible.cfg"
     save_private_json(inventory_file, inventory)
     save_private_json(variables_file, variables)
-    private_text(ansible_config, (
-        "[defaults]\nhost_key_checking = True\nretry_files_enabled = False\n"
-        "[inventory]\nenable_plugins = yaml\n"
-        "[ssh_connection]\nssh_args = -o ControlMaster=no -o ControlPath=none -o ControlPersist=no\n"
-    ))
     runner.run(
         ["ansible-playbook", "--inventory", str(inventory_file),
          "--extra-vars", "@" + str(variables_file), str(entrypoint)],
         env={
             "ANSIBLE_CONFIG": str(ansible_config),
-            "ANSIBLE_ROLES_PATH": str(checkout / "roles"),
+            "KUBECONFIG": None,
             "ANSIBLE_LOCAL_TEMP": str(runner.generation / "ansible-local"),
             "ANSIBLE_REMOTE_TEMP": ".ansible/iscsi-rebuild-canary",
         },
@@ -540,8 +545,17 @@ def initialize_ansible(config, runner, api, initiator_iqn, expected_vm):
     )
     validate_generation_kubeconfig(config, runner)
     identity = read_private_json(runner.generation / "node-identity.json")
-    if not all(isinstance(identity.get(key), str) and identity[key] for key in ("machine_id", "boot_id")):
-        raise CanaryError("Ansible did not export public machine_id and boot_id identities")
+    try:
+        if (
+            identity.get("fixture_id") != config["fixture_id"]
+            or identity.get("node_name") != node_name(config)
+            or not isinstance(identity.get("machine_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", identity["machine_id"])
+            or str(uuid.UUID(identity["boot_id"])) != identity["boot_id"]
+        ):
+            raise ValueError
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise CanaryError("Ansible node identity export does not match the fixture and canonical machine/boot identities") from None
     return identity
 
 

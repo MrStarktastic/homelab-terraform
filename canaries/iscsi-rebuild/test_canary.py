@@ -114,6 +114,7 @@ class InfrastructureTests(PrivateFilesTest):
         checkout = self.work / "ansible"
         (checkout / "canaries").mkdir(parents=True)
         (checkout / "canaries" / "iscsi-rebuild.yml").write_text("---\n")
+        (checkout / "canaries" / "ansible.cfg").write_text("[defaults]\n")
         private_key = self.work / "id_ed25519"
         private_key.write_text("synthetic private key, never a credential")
         private_key.chmod(0o600)
@@ -203,6 +204,12 @@ class InfrastructureTests(PrivateFilesTest):
         entrypoint = Path(self.config["ansible_checkout"]) / "canaries" / "iscsi-rebuild.yml"
         entrypoint.unlink()
         with self.assertRaisesRegex(self.infra.CanaryError, "Ansible.*entry"):
+            self.infra.validate_config(self.config)
+
+    def test_missing_scoped_ansible_config_fails_before_mutation(self):
+        path = Path(self.config["ansible_checkout"]) / "canaries" / "ansible.cfg"
+        path.unlink()
+        with self.assertRaisesRegex(self.infra.CanaryError, "Ansible.*config"):
             self.infra.validate_config(self.config)
 
     def test_world_readable_private_key_and_symlink_are_rejected(self):
@@ -326,6 +333,7 @@ class InfrastructureTests(PrivateFilesTest):
         host = groups["iscsi_canary"]["hosts"][self.values["name"]]
         self.assertIn("StrictHostKeyChecking=yes", host["ansible_ssh_common_args"])
         self.assertIn(str(runner.generation / "known_hosts"), host["ansible_ssh_common_args"])
+        self.assertEqual(host.get("ansible_ssh_args"), "-o ControlMaster=no -o ControlPath=none -o ControlPersist=no")
         self.assertNotIn("skip", json.dumps(variables))
         self.assertEqual(variables["k3s_version"], "v1.36.4+k3s1")
         self.assertEqual(variables["canary_state_dir"], str(runner.generation))
@@ -569,6 +577,38 @@ class InfrastructureTests(PrivateFilesTest):
         with self.assertRaises(self.infra.CanaryError):
             run.initial()
         self.assertFalse(any(argv[0] == "ansible-playbook" for argv in world.commands))
+
+    def test_ansible_process_uses_companion_scoped_config(self):
+        run, world, _, _ = self.canary_world()
+        run.initial()
+        env = next(env for argv, env in zip(world.commands, world.environments) if argv[0] == "ansible-playbook")
+        expected = str(Path(self.config["ansible_checkout"]) / "canaries" / "ansible.cfg")
+        self.assertEqual(env["ANSIBLE_CONFIG"], expected)
+        self.assertFalse((run.state / "generation-1" / "ansible.cfg").exists())
+
+    def test_ansible_has_no_selected_kubeconfig_or_production_overrides(self):
+        run, world, _, _ = self.canary_world()
+        forbidden = (
+            "KUBECONFIG", "ANSIBLE_VAULT_PASSWORD_FILE", "ANSIBLE_VAULT_IDENTITY_LIST",
+            "ANSIBLE_VARS_ENABLED", "ANSIBLE_INVENTORY", "ANSIBLE_ROLES_PATH",
+        )
+        with mock.patch.dict(os.environ, {key: "/untrusted/inherited-" + key for key in forbidden}):
+            run.initial()
+        for argv, env in zip(world.commands, world.environments):
+            if argv[0] == "ansible-playbook":
+                for key in forbidden:
+                    self.assertNotIn(key, env)
+            elif argv[0] in ("helm", "kubectl"):
+                self.assertEqual(
+                    env["KUBECONFIG"], argv[argv.index("--kubeconfig") + 1]
+                )
+
+    def test_ansible_export_must_match_fixture_and_node_identity(self):
+        run, world, _, _ = self.canary_world()
+        world.identity_override = {"fixture_id": "another-fixture", "node_name": "another-node"}
+        with self.assertRaisesRegex(self.infra.CanaryError, "Ansible.*identity"):
+            run.initial()
+        self.assertFalse(any(argv[0] == "helm" for argv in world.commands))
 
 
 class TerraformRootTests(unittest.TestCase):
@@ -886,6 +926,8 @@ class OfflineWorld:
         self.live = self.reuse_metadata = False
         self.replace_during_host_pin = self.replaced_vm = False
         self.commands = []
+        self.environments = []
+        self.identity_override = {}
         self.objects = {}
         self.result = None
         from nas import NasConfig
@@ -910,7 +952,10 @@ class OfflineWorld:
 
     @property
     def identity(self):
-        return {"machine_id": f"{self.creations:032x}", "boot_id": str(uuid.UUID(int=self.creations))}
+        return {
+            "fixture_id": self.config["fixture_id"], "node_name": self.infra.node_name(self.config),
+            "machine_id": f"{self.creations:032x}", "boot_id": str(uuid.UUID(int=self.creations)),
+        }
 
     def values(self):
         return {
@@ -948,6 +993,7 @@ class OfflineWorld:
 
     def process(self, argv, **kwargs):
         self.commands.append(argv)
+        self.environments.append(kwargs["env"].copy())
         output = ""
         if argv[0] == "terraform":
             state = self.work / "state" / "terraform.tfstate"
@@ -975,7 +1021,7 @@ class OfflineWorld:
             variables = self.infra.read_private_json(Path(argv[argv.index("--extra-vars") + 1][1:]))
             generation = Path(variables["canary_state_dir"])
             self.infra.private_text(generation / "kubeconfig", "synthetic, parsed at the kubectl process boundary")
-            self.infra.save_private_json(generation / "node-identity.json", self.identity)
+            self.infra.save_private_json(generation / "node-identity.json", self.identity | self.identity_override)
         elif argv[0] == "kubectl":
             output = self.kubectl(argv, kwargs.get("input"))
         elif argv[0] != "helm":
