@@ -1,0 +1,71 @@
+name: Validate isolated iSCSI rebuild canary
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'canaries/iscsi-rebuild/**'
+      - 'modules/vm/**'
+      - '.github/workflows/validate-canary.yml'
+      - '.github/workflows/validate-and-plan.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  offline-validation:
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: '1'
+      TF_INPUT: '0'
+      CHECKPOINT_DISABLE: '1'
+      TF_DATA_DIR: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/terraform-data
+      KUBECONFIG: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/no-kubeconfig
+      HELM_CACHE_HOME: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/helm/cache
+      HELM_CONFIG_HOME: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/helm/config
+      HELM_DATA_HOME: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/helm/data
+      PIP_CACHE_DIR: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/pip
+      GOCACHE: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/go-cache
+      GOMODCACHE: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/go-mod
+      GOBIN: ${{ github.workspace }}/canaries/iscsi-rebuild/.checks/bin
+    steps:
+      - uses: actions/checkout@v7
+      - name: Create scoped validation directories
+        run: |
+          mkdir -p canaries/iscsi-rebuild/.checks/build
+          echo "TMPDIR=$GITHUB_WORKSPACE/canaries/iscsi-rebuild/.checks/build" >> "$GITHUB_ENV"
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: '1.16.1'
+          terraform_wrapper: false
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.4
+      - name: Test real SQLite and mocked API/process boundaries
+        run: |
+          python3 -B -m unittest discover -s canaries/iscsi-rebuild -p 'test_*.py'
+          python3 -m compileall -q canaries/iscsi-rebuild
+      - name: Validate isolated Terraform without a backend or live credentials
+        env:
+          TMPDIR: .checks/build
+          PM_API_URL: https://pve.example.invalid:8006/api2/json
+          PM_API_TOKEN_ID: offline@pve!canary
+          PM_API_TOKEN_SECRET: offline-validation-only
+        run: |
+          terraform -chdir=canaries/iscsi-rebuild fmt -check
+          terraform -chdir=canaries/iscsi-rebuild init -backend=false -input=false
+          terraform -chdir=canaries/iscsi-rebuild validate
+      - name: Render and check the exact CSI chart
+        run: |
+          python3 -m pip install -r canaries/iscsi-rebuild/requirements-checks.txt
+          helm --kubeconfig "$KUBECONFIG" pull democratic-csi --repo https://democratic-csi.github.io/charts/ --version 0.15.1 --destination canaries/iscsi-rebuild/.checks
+          helm --kubeconfig "$KUBECONFIG" lint canaries/iscsi-rebuild/.checks/democratic-csi-0.15.1.tgz --values canaries/iscsi-rebuild/csi-values.yaml --strict
+          helm --kubeconfig "$KUBECONFIG" template canary-csi canaries/iscsi-rebuild/.checks/democratic-csi-0.15.1.tgz --namespace iscsi-rebuild-csi --kube-version 1.36.4 --values canaries/iscsi-rebuild/csi-values.yaml > canaries/iscsi-rebuild/.checks/rendered.yaml
+          python3 -B canaries/iscsi-rebuild/validate_chart.py canaries/iscsi-rebuild/.checks/rendered.yaml --fixture-output canaries/iscsi-rebuild/.checks/schema-fixtures.json
+      - name: Check Kubernetes schemas without a cluster
+        run: |
+          export PATH="$GOBIN:$PATH"
+          if ! kubeconform -v; then
+            go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0
+          fi
+          kubeconform -strict -summary -kubernetes-version 1.36.4 canaries/iscsi-rebuild/.checks/rendered.yaml canaries/iscsi-rebuild/.checks/schema-fixtures.json
