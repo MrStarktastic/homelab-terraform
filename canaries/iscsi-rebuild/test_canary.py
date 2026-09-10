@@ -339,6 +339,13 @@ class InfrastructureTests(PrivateFilesTest):
         self.assertEqual(variables["canary_state_dir"], str(runner.generation))
         self.assertEqual(variables["canary_node_name"], self.values["name"])
 
+    def test_ansible_inventory_emits_required_canonical_private_key_variable(self):
+        runner = self.infra.Runner(self.work, self.work / "generation-1")
+        inventory, _ = self.infra.ansible_inputs(self.config, runner, "iqn.2026-09.invalid:unit-proof")
+        host = inventory["all"]["children"]["iscsi_canary"]["hosts"][self.values["name"]]
+        self.assertEqual(host.get("ansible_private_key_file"), self.config["ssh_private_key_file"])
+        self.assertNotIn("ansible_ssh_private_key_file", host)
+
     def test_tf_apply_is_scoped_and_rechecks_live_ownership_after_plan(self):
         self.assertTrue(hasattr(self.infra, "TerraformVM"), "TerraformVM is not implemented")
         runner = self.infra.Runner(self.work, self.work / "generation-1")
@@ -1018,6 +1025,10 @@ class OfflineWorld:
                         "name": "vm", "instances": [{"attributes": self.values()}],
                     }]})
         elif argv[0] == "ansible-playbook":
+            inventory = self.infra.read_private_json(Path(argv[argv.index("--inventory") + 1]))
+            host = inventory["all"]["children"]["iscsi_canary"]["hosts"][self.infra.node_name(self.config)]
+            if host.get("ansible_private_key_file") != self.config["ssh_private_key_file"]:
+                return subprocess.CompletedProcess(argv, 1, "", "canonical ansible_private_key_file is required")
             variables = self.infra.read_private_json(Path(argv[argv.index("--extra-vars") + 1][1:]))
             generation = Path(variables["canary_state_dir"])
             self.infra.private_text(generation / "kubeconfig", "synthetic, parsed at the kubectl process boundary")

@@ -84,7 +84,11 @@ record. Stop and review any conflict while retaining the private ownership
 state and marked NAS objects.
 
 The Ansible invocation uses an explicit JSON inventory with one host in
-`iscsi_canary` and `masters`. Inputs are `canary_fixture_id`,
+`iscsi_canary` and `masters`. Connection variables are `ansible_host`,
+`ansible_user`, **`ansible_private_key_file`**, `ansible_ssh_args` and
+`ansible_ssh_common_args`. The companion guard requires the canonical
+`ansible_private_key_file`; the `ansible_ssh_private_key_file` alias is not
+sufficient. Inputs are `canary_fixture_id`,
 `canary_node_name`, `canary_iscsi_iqn`, absolute `canary_state_dir`,
 `k3s_version: v1.36.4+k3s1` and `flannel_iface` (normally `eth1`), plus explicit
 SSH host/user/key and strict generation-specific known_hosts. The play exports

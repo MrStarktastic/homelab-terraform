@@ -402,7 +402,7 @@ def ansible_inputs(config, runner, initiator_iqn):
     host = {
         "ansible_host": str(ipaddress.ip_interface(config["management_cidr"]).ip),
         "ansible_user": config["ciuser"],
-        "ansible_ssh_private_key_file": config["ssh_private_key_file"],
+        "ansible_private_key_file": config["ssh_private_key_file"],
         "ansible_ssh_args": "-o ControlMaster=no -o ControlPath=none -o ControlPersist=no",
         "ansible_ssh_common_args": (
             "-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
