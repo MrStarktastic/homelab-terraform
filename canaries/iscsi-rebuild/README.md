@@ -281,3 +281,13 @@ merge, the maintainer must use its existing no-apply guard (`[skip ci]` in the
 PR body is explicitly checked there), or separately review a workflow-scope
 change. Canary-only changes no longer generate a production plan; the canary
 validator never supplies an artifact to the production apply workflow.
+
+The companion Ansible repository has a **different merge guard**:
+`.github/workflows/deploy.yml` deploys production on **push to `main`** and
+does not inspect the PR body. For an authoring-only merge, the resulting
+**Ansible merge commit message must contain `[skip ci]`** so GitHub skips that
+push-triggered workflow. An Ansible PR body marker alone is insufficient.
+Title **both PRs** with `[skip ci]`, retain the Terraform PR **body** marker,
+and verify the marker remains in the actual Ansible merge commit message
+before any separately approved merge; edited merge/squash messages must also
+retain it. Do not manually dispatch either repository's production workflow.
