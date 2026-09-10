@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 
 from proof import (
-    DRIVER, ROOT, binding_objects, chap_secret, fixture_pod, metadata,
+    DRIVER, ROOT, binding_objects, chap_secret, driver_config, fixture_pod, metadata,
 )
 
 
-def validate_documents(documents):
+def validate_documents(documents, *, recovery=False):
+    import yaml
+
     allowed = {"ServiceAccount", "Secret", "ConfigMap", "ClusterRole", "ClusterRoleBinding", "DaemonSet", "CSIDriver"}
     if not documents or any(obj.get("kind") not in allowed for obj in documents):
         raise ValueError("node-only chart must not render controllers, storage classes, snapshotters or unknown objects")
@@ -18,8 +20,10 @@ def validate_documents(documents):
     if len(drivers) != 1 or drivers[0]["metadata"]["name"] != DRIVER or drivers[0]["spec"].get("attachRequired") is not False or len(nodes) != 1:
         raise ValueError("expected one node DaemonSet and the exact attachRequired:false CSI driver")
     secrets = [obj for obj in documents if obj["kind"] == "Secret"]
-    if len(secrets) != 1 or secrets[0].get("stringData", {}).get("driver-config-file.yaml", "").strip() != "driver: node-manual":
-        raise ValueError("chart config must contain only node-manual, never NAS admin credentials")
+    if len(secrets) != 1 or yaml.safe_load(
+        secrets[0].get("stringData", {}).get("driver-config-file.yaml", "")
+    ) != driver_config(recovery):
+        raise ValueError("chart config must match the exact node-manual/no-create policy, without NAS admin credentials")
     pod = nodes[0]["spec"]["template"]["spec"]
     containers = pod["containers"]
     if any(c["name"] not in {"csi-driver", "csi-proxy", "driver-registrar", "cleanup"} for c in containers):
@@ -35,6 +39,8 @@ def validate_documents(documents):
     ):
         raise ValueError("CSI identity/version must match static PVs and run only in node mode")
     env = {item["name"]: item.get("value") for item in driver.get("env", [])}
+    if env.get("FILESYSTEM_TYPE_DETECTION_STRATEGY") != "blkid":
+        raise ValueError("filesystem detection must match the tested native blkid staging path")
     if env.get("ISCSIADM_HOST_STRATEGY") != "chroot" or env.get("ISCSIADM_HOST_PATH") != "/usr/sbin/iscsiadm":
         raise ValueError("node-manual must use the host's installed iscsiadm and stable initiator")
     volumes = {item["name"]: item for item in pod.get("volumes", [])}
@@ -73,11 +79,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("rendered", type=Path)
     parser.add_argument("--fixture-output", type=Path)
+    parser.add_argument("--recovery", action="store_true")
+    parser.add_argument("--recovery-values", type=Path)
     args = parser.parse_args()
     documents = [obj for obj in yaml.safe_load_all(args.rendered.read_text()) if obj]
-    validate_documents(documents)
+    validate_documents(documents, recovery=args.recovery)
     if args.fixture_output:
         args.fixture_output.write_text(json.dumps(schema_fixtures(), indent=2) + "\n")
+    if args.recovery_values:
+        args.recovery_values.write_text(json.dumps({"driver": {"config": driver_config(True)}}, indent=2) + "\n")
     print(f"Verified {len(documents)} pinned node-only Helm objects; no controller or storage class")
 
 

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import ssl
 import stat
 import subprocess
@@ -123,7 +124,7 @@ def validate_config(value, *, require_ansible=True):
         "storage_bridge", "nameserver", "ciuser", "ssh_public_key_file",
         "ssh_private_key_file", "cloudinit_storage", "os_storage", "ansible_checkout", "nas",
     }
-    optional = {"proxmox_ca_file", "flannel_iface"}
+    optional = {"proxmox_ca_file", "flannel_iface", "ansible_runtime_dir"}
     if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - optional:
         raise CanaryError("operator config has missing or unknown keys; credentials belong in the environment")
     config = json.loads(json.dumps(value))
@@ -213,6 +214,39 @@ def private_text(path, text):
         stream.write(text)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def prepare_ansible_runtime(config):
+    value = config.get("ansible_runtime_dir")
+    value = str(ROOT.parents[1] / ".ar") if value is None else value
+    if not isinstance(value, str) or any(c.isspace() for c in value):
+        raise CanaryError("Ansible runtime directory must be an absolute canonical private path")
+    runtime = Path(value)
+    if not runtime.is_absolute() or runtime.resolve() != runtime or runtime.is_symlink():
+        raise CanaryError("Ansible runtime directory must be canonical, without symlinks or traversal")
+    # multiprocessing normalizes TMPDIR and appends both of these names.
+    socket_example = runtime / "pymp-xxxxxxxx" / "listener-xxxxxxxx"
+    if len(os.fsencode(socket_example)) > 107:
+        raise CanaryError("Ansible runtime socket path exceeds 107 bytes; select a shorter private ansible_runtime_dir")
+    try:
+        runtime.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        raise CanaryError("cannot create the selected private Ansible runtime directory") from None
+    checked_path(str(runtime), private=True, directory=True)
+    if stat.S_IMODE(runtime.stat().st_mode) != 0o700:
+        raise CanaryError("Ansible runtime directory must be operator-owned mode0700")
+    probe = runtime / ("probe-" + uuid.uuid4().hex[:8])
+    bound = False
+    try:
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(probe))
+            bound = True
+    except OSError:
+        raise CanaryError("Ansible runtime directory cannot host private AF_UNIX sockets") from None
+    finally:
+        if bound:
+            probe.unlink()
+    return runtime
 
 
 def validate_vm_values(values, config):
@@ -354,7 +388,7 @@ class Runner:
         self.generation = private_directory(generation)
         home = private_directory(self.state / "home")
         # Go provider RPC sockets must fit AF_UNIX's short path limit. All
-        # children run at ROOT, so a relative private path avoids long worktrees.
+        # Terraform runs at ROOT; Ansible separately needs a short absolute path.
         process_tmp = private_directory(self.state / "process-tmp").relative_to(ROOT)
         self.env = {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -387,10 +421,10 @@ class Runner:
             raise CanaryError(f"{Path(argv[0]).name} failed (exit {result.returncode}); output suppressed to protect credentials")
         return result.stdout
 
-    def kubectl(self, *args, input_text=None):
+    def kubectl(self, *args, input_text=None, timeout=900):
         return self.run(
             ["kubectl", "--kubeconfig", self.env["KUBECONFIG"], "--request-timeout=30s", *args],
-            input_text=input_text,
+            input_text=input_text, timeout=timeout,
         )
 
     def helm(self, *args):
@@ -522,6 +556,7 @@ def validate_kubeconfig(value, config):
 def initialize_ansible(config, runner, api, initiator_iqn, expected_vm):
     checkout = checked_path(config["ansible_checkout"], directory=True)
     entrypoint, ansible_config = ansible_files(checkout)
+    runtime = prepare_ansible_runtime(config)
     if api.owned_vm(config) != expected_vm:
         raise CanaryError("VM identity changed before Ansible host-key preflight")
     api.pin_host_key(config, runner.generation)
@@ -538,6 +573,7 @@ def initialize_ansible(config, runner, api, initiator_iqn, expected_vm):
         env={
             "ANSIBLE_CONFIG": str(ansible_config),
             "KUBECONFIG": None,
+            "TMPDIR": str(runtime),
             "ANSIBLE_LOCAL_TEMP": str(runner.generation / "ansible-local"),
             "ANSIBLE_REMOTE_TEMP": ".ansible/iscsi-rebuild-canary",
         },

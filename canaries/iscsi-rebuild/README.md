@@ -17,6 +17,9 @@ Use the caller below, **not raw Terraform apply/destroy**.
    on the operator machine; Kubernetes gets only a scoped CHAP data-plane Secret.
 3. Create `iscsi-rebuild-canary-<fixture_id>`, pin its SSH host public key using
    authenticated Proxmox guest-agent reads, and initialize an isolated K3s node.
+   Wait up to 300 seconds for the API, node registration and readiness before
+   installing storage. A foreign node or a present mismatched identity fails
+   immediately, even while NotReady.
 4. Install democratic-csi chart **0.15.1**, node image **v1.9.5**, `node-manual`,
    with no controller/attacher/provisioner/resizer/snapshotter or chart-created
    StorageClass. The PVC explicitly uses `storageClassName: ""`.
@@ -37,6 +40,11 @@ Use the caller below, **not raw Terraform apply/destroy**.
 9. Initialize fresh K3s and replay the same static declarations. Recovery opens
    only an existing SQLite file, read-only, with the **external** nonce/hash,
    `PRAGMA integrity_check`, and no creation or reconstruction fallback.
+   Before any retained PV is deployed, install and verify the CSI recovery
+   configuration `node.format.ext4.customOptions: ["-n"]`. This is the supported
+   driver option path for native `mke2fs`'s documented **no-create** mode.
+   Unknown/empty storage remains unformatted and staging fails at `blkid`;
+   read-only pod publishing alone does not provide this guarantee.
 10. Require new VM SMBIOS UUID, machine ID, boot ID, Kubernetes Node UID,
     `kube-system` namespace UID and PVC UID; unchanged logical VM identity,
     binding hash and exact SQLite bytes. Only then write the full success record.
@@ -59,6 +67,14 @@ python:3.13-slim@sha256:cc9dffa47c8294ba9bb795a8dfaeb7b76f2b30acade2c52a461a2999
   The selected SSH key must work noninteractively, and the cloud-init user must
   have passwordless sudo. User SSH agents, vault files and password prompts are
   not inherited.
+- A short private Ansible controller runtime directory. By default the caller
+  uses `.ar/` at the Terraform checkout root, operator-owned mode 0700. Python
+  normalizes TMPDIR before creating multiprocessing RPC sockets, so the caller
+  checks the complete socket path budget (107 bytes on Linux) and probes a
+  private socket **before provisioning**. Set `ansible_runtime_dir` to an
+  explicitly selected short, canonical mode-0700 directory if the checkout is
+  too deep; a private directory under the operator's OS runtime directory is
+  suitable. Its parent must exist. No shared world-writable directory is used.
 - Reserve an unused VM ID, two unused host IPv4/CIDRs on separate bridges and
   subnets, and a gateway/DNS route appropriate for that disposable node. The
   NAS portal must be on the storage subnet. Exactly one gateway is non-null.
@@ -180,7 +196,10 @@ An existing state file alone never authorizes deletion: the private owner
 record, isolated single-resource state and actual VM name/tag/ID must agree.
 Provider process files stay in a private, project-relative `process-tmp`
 directory under that state. The fixed working directory also keeps provider
-Unix-socket paths below their length limit in deeply nested worktrees.
+Unix-socket paths below their length limit in deeply nested worktrees. Ansible
+receives a separate validated **absolute** short TMPDIR; the Terraform-relative
+path must not be reused for Python multiprocessing. Runtime preflight removes
+only the exact probe socket it created, never another process's runtime files.
 
 Success is the private `.state/<fixture_id>/rebuild-evidence.json` record with
 `full_rebuild_verified: true`. Merely completing `initial` is **not** a rebuild
@@ -228,8 +247,25 @@ kubeconform. Telmate's validation requires syntactically populated environment
 inputs, so that workflow uses only literal `.invalid` endpoints and dummy tokens.
 It has read-only repository permissions, no live secret inputs, no plan/apply,
 no runtime canary invocation and no state/secret artifact upload.
-`requirements-checks.txt` is for YAML render validation only; the operator
-implementation and SQLite probe use the Python standard library.
+`requirements-checks.txt` is for offline validation only; the operator
+implementation and SQLite probe use the Python standard library. The check
+requirements also pin Ansible core 2.21.3 for the real controller-only test
+(Python 3.12+ for that validation toolchain).
+
+`test_driver_staging.cjs` loads the unmodified, checksummed democratic-csi
+v1.9.5 source and executes its actual `NodeStageVolume`. Only iSCSI discovery,
+block-device classification and mount/resize syscalls are simulated; `blkid`
+and `mkfs.ext4` operate on exclusive private regular-file images, never real
+devices. A positive control really formats an empty image. Recovery with
+`-n` leaves an empty image byte-identical and refuses staging, while an existing
+ext4 image stages without invoking a formatter. The real upstream manual-PV
+contract also requires `volumeAttributes.provisioner_driver: node-manual`,
+which is included in both generations' identical binding declarations.
+
+The no-create guard does not claim a general block-device write lock: normal
+upstream mounting/resizing of an already formatted filesystem remains its
+behavior. The canary uses the whole, unpartitioned ext4 zvol prepared for this
+fixture; it does not substitute raw-block tests or vendor modifications.
 
 ### Repository merge guard
 

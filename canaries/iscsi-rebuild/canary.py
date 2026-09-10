@@ -16,6 +16,7 @@ import uuid
 from infrastructure import (
     CanaryError, ROOT, ProxmoxAPI, Runner, TerraformVM, checked_path, confirm,
     digest, initialize_ansible, node_name, private_directory,
+    prepare_ansible_runtime,
     read_private_json, save_private_json, validate_config, validate_generation_kubeconfig, validate_state,
 )
 from nas import NasConfig, TrueNasAPI, prepare_fixture, verify_fixture
@@ -73,8 +74,8 @@ class CanaryRun:
         self.phase("generation-" + str(number) + "-created")
         identity = initialize_ansible(self.config, runner, self.api, connection["initiator_iqn"], vm)
         cluster = ClusterProof(self.config, runner)
-        cluster.cluster_identity(vm, identity)
-        cluster.deploy(connection)
+        cluster.wait_ready(vm, identity)
+        cluster.deploy(connection, recovery=number == 2)
         return cluster, vm, identity
 
     def initial(self):
@@ -82,6 +83,7 @@ class CanaryRun:
             "owner.json", "terraform.tfstate", "generation-1", "first-evidence.json", "nas.json"
         )):
             raise CanaryError("initial proof requires a new local fixture; existing data/state is never reset")
+        prepare_ansible_runtime(self.config)
         self.api.require_unused(self.config)
         save_private_json(self.state / "owner.json", self.owner_identity())
         self.phase("preparing-marked-nas-fixture")
@@ -102,6 +104,7 @@ class CanaryRun:
             raise CanaryError("rebuild requires the completed first-generation proof; partial runs are not silently resumed")
         if (self.state / "generation-2").exists():
             raise CanaryError("replacement generation already exists; refusing to destroy the current VM")
+        prepare_ansible_runtime(self.config)
         first = read_private_json(self.state / "first-evidence.json")
         expected_data(first.get("data"))
         if first.get("vm") != owner.get("vm") or first.get("fixture_id") != self.config["fixture_id"]:

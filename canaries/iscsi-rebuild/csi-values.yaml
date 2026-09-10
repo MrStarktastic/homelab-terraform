@@ -34,6 +34,8 @@ node:
     # the host initiator identity and iscsid socket. node-manual has no
     # automatic /etc/iscsi mount in chart 0.15.1.
     extraEnv:
+      - name: FILESYSTEM_TYPE_DETECTION_STRATEGY
+        value: blkid
       - name: ISCSIADM_HOST_STRATEGY
         value: chroot
       - name: ISCSIADM_HOST_PATH

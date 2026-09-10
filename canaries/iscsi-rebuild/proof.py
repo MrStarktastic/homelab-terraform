@@ -16,6 +16,15 @@ RWOP_MESSAGE = "PersistentVolumeClaim with ReadWriteOncePod access mode already 
 RETAIN = {"argocd.argoproj.io/sync-options": "Prune=false,Delete=false"}
 
 
+def driver_config(recovery=False):
+    config = {"driver": "node-manual"}
+    if recovery:
+        # NodeStage precedes read-only NodePublish. mke2fs -n is its supported
+        # no-create option; an unknown filesystem then fails the driver's blkid.
+        config["node"] = {"format": {"ext4": {"customOptions": ["-n"]}}}
+    return config
+
+
 def metadata(config, name, *, namespaced=True):
     result = {"name": name, "labels": {"iscsi-rebuild-canary": config["fixture_id"]}}
     if namespaced:
@@ -54,7 +63,10 @@ def binding_objects(config, connection):
             "storageClassName": "", "claimRef": {"name": "sqlite", "namespace": namespace},
             "csi": {
                 "driver": DRIVER, "volumeHandle": connection["volume_handle"], "fsType": "ext4",
-                "volumeAttributes": {"node_attach_driver": "iscsi", **{k: connection[k] for k in ("portal", "iqn", "lun")}},
+                "volumeAttributes": {
+                    "provisioner_driver": "node-manual", "node_attach_driver": "iscsi",
+                    **{k: connection[k] for k in ("portal", "iqn", "lun")},
+                },
                 "nodeStageSecretRef": {"name": "iscsi-chap", "namespace": namespace},
             },
         },
@@ -206,7 +218,7 @@ class ClusterProof:
         self.runner = runner
         self.namespace = node_name(config)
 
-    def get(self, kind, name=None, *, namespaced=False, field_selector=None):
+    def get(self, kind, name=None, *, namespaced=False, field_selector=None, timeout=900):
         args = ["get", kind]
         if name is not None:
             args.append(name)
@@ -214,16 +226,20 @@ class ClusterProof:
             args += ["--namespace", self.namespace]
         if field_selector:
             args += ["--field-selector", field_selector]
-        return json.loads(self.runner.kubectl(*args, "-o", "json"))
+        return json.loads(self.runner.kubectl(*args, "-o", "json", timeout=timeout))
 
     def apply(self, objects):
         self.runner.kubectl("apply", "-f", "-", input_text=json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}))
 
-    def deploy(self, connection):
+    def deploy(self, connection, *, recovery=False):
         validate_connection(self.config, connection)
         self.apply([{"apiVersion": "v1", "kind": "Namespace", "metadata": metadata(self.config, self.namespace, namespaced=False)}])
         node_values = self.runner.generation / "csi-node-values.json"
-        save_private_json(node_values, {"node": {"nodeSelector": {"kubernetes.io/hostname": self.namespace}}})
+        expected_driver = driver_config(recovery)
+        save_private_json(node_values, {
+            "node": {"nodeSelector": {"kubernetes.io/hostname": self.namespace}},
+            "driver": {"config": expected_driver},
+        })
         self.runner.helm(
             "upgrade", "--install", "canary-csi", "democratic-csi",
             "--repo", "https://democratic-csi.github.io/charts/", "--version", CHART_VERSION,
@@ -231,6 +247,12 @@ class ClusterProof:
             "--values", str(ROOT / "csi-values.yaml"), "--values", str(node_values),
             "--wait", "--timeout", "5m",
         )
+        if recovery:
+            observed = json.loads(self.runner.helm(
+                "get", "values", "canary-csi", "--namespace", CSI_NAMESPACE, "--output", "json"
+            ))
+            if observed.get("driver", {}).get("config") != expected_driver:
+                raise CanaryError("recovery CSI no-create configuration was not installed; refusing retained PV deployment")
         program = {
             "apiVersion": "v1", "kind": "ConfigMap", "metadata": metadata(self.config, "sqlite-program"),
             "immutable": True, "data": {"fixture.py": (ROOT / "fixture.py").read_text()},
@@ -258,24 +280,34 @@ class ClusterProof:
             time.sleep(2)
         raise CanaryError("fixture did not report SQLite evidence before timeout")
 
-    def cluster_identity(self, vm, identity):
-        nodes = self.get("nodes").get("items", [])
+    def node_identity(self, nodes, vm, identity, *, pending=False):
+        if not isinstance(nodes, list):
+            raise CanaryError("Kubernetes node identity response is invalid")
+        if not nodes and pending:
+            return None
         if len(nodes) != 1:
-            raise CanaryError("the proof requires exactly one isolated Kubernetes node")
+            raise CanaryError("node identity requires exactly one isolated Kubernetes node")
         node = nodes[0]
         meta, status = node.get("metadata", {}), node.get("status", {})
         info = status.get("nodeInfo", {})
         if (
             meta.get("name") != self.namespace or not meta.get("uid")
-            or not any(c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions", []))
-            or not identity.get("machine_id") or info.get("machineID") != identity["machine_id"]
-            or not identity.get("boot_id") or info.get("bootID") != identity["boot_id"]
-            or info.get("systemUUID", "").lower() != vm["uuid"].lower()
+            or not identity.get("machine_id") or not identity.get("boot_id") or not vm.get("uuid")
         ):
             raise CanaryError("Kubernetes node identity does not match the verified disposable VM and Ansible boot evidence")
-        namespace = self.get("namespace", "kube-system").get("metadata", {}).get("uid")
-        if not namespace:
-            raise CanaryError("kube-system namespace identity is missing")
+        expected = {
+            "machineID": identity["machine_id"], "bootID": identity["boot_id"], "systemUUID": vm["uuid"]
+        }
+        for key, value in expected.items():
+            actual = info.get(key)
+            if actual and (not isinstance(actual, str) or actual.lower() != value.lower()):
+                raise CanaryError("Kubernetes node identity differs from the verified VM/boot identity")
+        if not all(info.get(key) for key in expected) or not any(
+            c.get("type") == "Ready" and c.get("status") == "True" for c in status.get("conditions", [])
+        ):
+            if pending:
+                return None
+            raise CanaryError("Kubernetes node is not Ready with complete matching identity")
         return {
             "fixture_id": self.config["fixture_id"],
             "vm": vm,
@@ -283,8 +315,38 @@ class ClusterProof:
                 "name": meta["name"], "uid": meta["uid"],
                 "machine_id": info["machineID"], "boot_id": info["bootID"],
             },
-            "kube_system_uid": namespace,
         }
+
+    def cluster_identity(self, vm, identity):
+        result = self.node_identity(self.get("nodes").get("items"), vm, identity)
+        namespace = self.get("namespace", "kube-system").get("metadata", {}).get("uid")
+        if not namespace:
+            raise CanaryError("kube-system namespace identity is missing")
+        return result | {"kube_system_uid": namespace}
+
+    def wait_ready(self, vm, identity, timeout=300):
+        deadline = time.monotonic() + timeout
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                nodes = self.get("nodes", timeout=min(30, remaining)).get("items")
+            except CanaryError:
+                pass
+            else:
+                result = self.node_identity(nodes, vm, identity, pending=True)
+                if result is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        namespace = self.get(
+                            "namespace", "kube-system", timeout=min(30, remaining)
+                        ).get("metadata", {}).get("uid")
+                    except CanaryError:
+                        namespace = None
+                    if namespace:
+                        return result | {"kube_system_uid": namespace}
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+        raise CanaryError("timed out waiting for canary API, node registration and readiness")
 
     def snapshot(self, connection, vm, identity):
         result = self.cluster_identity(vm, identity)

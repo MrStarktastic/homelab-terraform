@@ -1,4 +1,4 @@
-"""Offline canary checks. External processes/APIs are never invoked unmocked."""
+"""Offline checks; infrastructure is mocked, controller-only Ansible is real."""
 
 import hashlib
 import importlib
@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
+import sys
 import unittest
 from unittest import mock
 import uuid
@@ -617,6 +618,131 @@ class InfrastructureTests(PrivateFilesTest):
             run.initial()
         self.assertFalse(any(argv[0] == "helm" for argv in world.commands))
 
+    @unittest.skipUnless(shutil.which("ansible-playbook") and shutil.which("kubectl"), "controller integration tools required")
+    def test_actual_ansible_controller_tasks_use_caller_runtime_environment(self):
+        runner = self.infra.Runner(self.work, self.work / "generation-1")
+        identity = {
+            "fixture_id": self.config["fixture_id"], "node_name": self.values["name"],
+            "machine_id": "1" * 32, "boot_id": str(uuid.UUID(int=1)),
+        }
+        kubeconfig = {
+            "apiVersion": "v1", "kind": "Config", "current-context": "default",
+            "clusters": [{"name": "default", "cluster": {"server": "https://192.0.2.10:6443", "certificate-authority-data": "Y2E="}}],
+            "users": [{"name": "default", "user": {"client-certificate-data": "Y2VydA==", "client-key-data": "a2V5"}}],
+            "contexts": [{"name": "default", "context": {"cluster": "default", "user": "default"}}],
+        }
+        play = [{
+            "hosts": "iscsi_canary", "connection": "local", "become": False,
+            "gather_facts": False, "vars": {"ansible_python_interpreter": sys.executable},
+            "tasks": [
+                {"ansible.builtin.assert": {"that": ["lookup('env', 'KUBECONFIG') == ''"]}},
+                {"ansible.builtin.copy": {"dest": "{{ canary_state_dir }}/kubeconfig", "content": json.dumps(kubeconfig), "mode": "0600"}},
+                {"ansible.builtin.copy": {"dest": "{{ canary_state_dir }}/node-identity.json", "content": json.dumps(identity), "mode": "0600"}},
+            ],
+        }]
+        (Path(self.config["ansible_checkout"]) / "canaries" / "iscsi-rebuild.yml").write_text(json.dumps(play))
+        api = mock.Mock()
+        api.owned_vm.return_value = {"uuid": "controller-only-probe"}
+        results = []
+        actual_run = subprocess.run
+
+        def capture(argv, **kwargs):
+            self.assertIn(argv[0], ("ansible-playbook", "kubectl"))
+            result = actual_run(argv, **kwargs)
+            results.append(result)
+            return result
+
+        with mock.patch("subprocess.run", side_effect=capture):
+            try:
+                observed = self.infra.initialize_ansible(
+                    self.config, runner, api, "iqn.2026-09.invalid:controller-only", api.owned_vm.return_value
+                )
+            except self.infra.CanaryError as error:
+                detail = "\n".join(result.stdout + result.stderr for result in results)
+                self.fail(f"Actual controller-only Ansible must succeed with caller env: {error}\n{detail[-2400:]}")
+        self.assertEqual(observed, identity)
+
+    def test_generation_waits_for_node_readiness(self):
+        run, world, _, _ = self.canary_world()
+        world.not_ready_reads = 1
+        try:
+            run.initial()
+        except self.infra.CanaryError as error:
+            self.fail(f"Expected bounded readiness retries instead of immediate failure: {error}")
+        self.assertGreaterEqual(world.node_queries, 2)
+        self.assertTrue(any(argv[0] == "helm" for argv in world.commands))
+
+    def test_generation_waits_for_api_and_node_registration(self):
+        run, world, _, _ = self.canary_world()
+        world.node_api_failures = 1
+        world.missing_node_reads = 1
+        run.initial()
+        self.assertGreaterEqual(world.node_queries, 2)
+
+    def test_readiness_wait_rejects_foreign_and_mismatched_nodes_immediately(self):
+        run, world, _, _ = self.canary_world()
+        world.not_ready_reads = 99
+        world.node_name_override = "foreign-node"
+        with self.assertRaisesRegex(self.infra.CanaryError, "identity"):
+            run.initial()
+        self.assertEqual(world.node_queries, 1)
+        self.assertFalse(any(argv[0] == "helm" for argv in world.commands))
+
+    def test_readiness_wait_rejects_mismatched_boot_even_when_not_ready(self):
+        run, world, _, _ = self.canary_world()
+        world.not_ready_reads = 99
+        world.node_boot_override = str(uuid.UUID(int=987))
+        with self.assertRaisesRegex(self.infra.CanaryError, "identity"):
+            run.initial()
+        self.assertEqual(world.node_queries, 1)
+        self.assertFalse(any(argv[0] == "helm" for argv in world.commands))
+
+    def test_readiness_timeout_never_deploys_storage(self):
+        run, world, _, _ = self.canary_world()
+        world.not_ready_reads = 999
+        with self.assertRaisesRegex(self.infra.CanaryError, "timed out"):
+            run.initial()
+        self.assertGreater(world.node_queries, 1)
+        self.assertFalse(any(argv[0] == "helm" for argv in world.commands))
+
+    def test_readiness_api_process_is_bounded_by_poll_deadline(self):
+        run, world, _, _ = self.canary_world()
+        run.initial()
+        timeouts = [
+            timeout for argv, timeout in zip(world.commands, world.timeouts)
+            if argv[0] == "kubectl" and "get" in argv and "nodes" in argv
+        ]
+        self.assertGreater(timeouts[0], 0)
+        self.assertLessEqual(timeouts[0], 30)
+
+    def test_long_ansible_runtime_path_is_refused_before_provisioning(self):
+        run, world, prepare, _ = self.canary_world()
+        run.config["ansible_runtime_dir"] = str(self.work / "far-too-long-for-manager-sockets")
+        with self.assertRaisesRegex(self.infra.CanaryError, "socket"):
+            run.initial()
+        prepare.assert_not_called()
+        self.assertEqual(world.creations, 0)
+
+    def test_ansible_runtime_rejects_public_directory_and_symlink(self):
+        for _ in range(30):
+            short = ROOT.parents[1] / ("r" + uuid.uuid4().hex[:2])
+            try:
+                short.mkdir(mode=0o700)
+                break
+            except FileExistsError:
+                continue
+        else:
+            self.fail("could not allocate private short runtime test directory")
+        self.addCleanup(lambda: short.unlink() if short.is_symlink() else short.rmdir())
+        short.chmod(0o755)
+        with self.assertRaises(self.infra.CanaryError):
+            self.infra.prepare_ansible_runtime(self.config | {"ansible_runtime_dir": str(short)})
+        self.assertEqual(short.stat().st_mode & 0o777, 0o755)
+        short.rmdir()
+        short.symlink_to(self.work)
+        with self.assertRaises(self.infra.CanaryError):
+            self.infra.prepare_ansible_runtime(self.config | {"ansible_runtime_dir": str(short)})
+
 
 class TerraformRootTests(unittest.TestCase):
     def test_separate_root_reuses_exact_module_without_production_backend(self):
@@ -672,6 +798,7 @@ class StorageProofTests(PrivateFilesTest):
         self.assertEqual(spec["csi"]["fsType"], "ext4")
         self.assertEqual(spec["csi"]["volumeHandle"], self.connection["volume_handle"])
         self.assertEqual(spec["csi"]["volumeAttributes"]["portal"], self.connection["portal"])
+        self.assertEqual(spec["csi"]["volumeAttributes"].get("provisioner_driver"), "node-manual")
         self.assertEqual(spec["csi"]["driver"], self.proof.DRIVER)
         self.assertEqual(pvc["spec"]["volumeName"], pv["metadata"]["name"])
         for item in (pv, pvc):
@@ -807,6 +934,21 @@ class StorageProofTests(PrivateFilesTest):
         self.assertFalse({"StorageClass", "Deployment", "Application", "ApplicationSet"} & kinds)
         self.assertTrue((ROOT / "csi-values.yaml").is_file())
 
+    def test_recovery_deployment_requires_observed_no_create_driver_config(self):
+        self.assertTrue(hasattr(self.proof, "driver_config"), "protected recovery config is missing")
+        cluster = self.cluster()
+        expected = self.proof.driver_config(True)
+        self.assertEqual(expected["node"]["format"]["ext4"]["customOptions"], ["-n"])
+        with mock.patch.object(cluster.runner, "run", return_value=json.dumps({"driver": {"config": expected}})):
+            cluster.deploy(self.connection, recovery=True)
+        values = self.load("infrastructure").read_private_json(cluster.runner.generation / "csi-node-values.json")
+        self.assertEqual(values["driver"]["config"], expected)
+        with mock.patch.object(cluster.runner, "run", return_value='{"driver":{"config":{"driver":"node-manual"}}}') as process:
+            with self.assertRaisesRegex(self.proof.CanaryError, "no-create"):
+                cluster.deploy(self.connection, recovery=True)
+        applied = [json.loads(call.kwargs["input_text"]) for call in process.call_args_list if call.kwargs.get("input_text")]
+        self.assertFalse(any(item["kind"] == "PersistentVolume" for document in applied for item in document["items"]))
+
     def test_container_boundary_returns_real_sqlite_evidence_and_cannot_reinitialize_on_recovery(self):
         self.assertTrue(hasattr(self.proof, "ClusterProof"), "cluster proof runner is not implemented")
         infra, fixture = self.load("infrastructure"), self.load("fixture")
@@ -934,9 +1076,15 @@ class OfflineWorld:
         self.replace_during_host_pin = self.replaced_vm = False
         self.commands = []
         self.environments = []
+        self.timeouts = []
         self.identity_override = {}
+        self.missing_node_reads = self.not_ready_reads = self.node_queries = 0
+        self.node_api_failures = 0
+        self.node_name_override = None
+        self.node_boot_override = None
         self.objects = {}
         self.result = None
+        self.csi_config = {}
         from nas import NasConfig
         nas_config = NasConfig(
             **config["nas"], fixture_id=config["fixture_id"], initiator_ip="198.51.100.10"
@@ -1001,6 +1149,7 @@ class OfflineWorld:
     def process(self, argv, **kwargs):
         self.commands.append(argv)
         self.environments.append(kwargs["env"].copy())
+        self.timeouts.append(kwargs["timeout"])
         output = ""
         if argv[0] == "terraform":
             state = self.work / "state" / "terraform.tfstate"
@@ -1034,8 +1183,17 @@ class OfflineWorld:
             self.infra.private_text(generation / "kubeconfig", "synthetic, parsed at the kubectl process boundary")
             self.infra.save_private_json(generation / "node-identity.json", self.identity | self.identity_override)
         elif argv[0] == "kubectl":
+            if "get" in argv and "nodes" in argv and self.node_api_failures:
+                self.node_api_failures -= 1
+                return subprocess.CompletedProcess(argv, 1, "", "API starting: connection refused")
             output = self.kubectl(argv, kwargs.get("input"))
-        elif argv[0] != "helm":
+        elif argv[0] == "helm":
+            if "upgrade" in argv:
+                files = [argv[i + 1] for i, value in enumerate(argv) if value == "--values"]
+                self.csi_config = self.infra.read_private_json(Path(files[-1])).get("driver", {}).get("config", {})
+            elif "get" in argv and "values" in argv:
+                output = json.dumps({"driver": {"config": self.csi_config}})
+        else:
             raise AssertionError("unexpected external process")
         return subprocess.CompletedProcess(argv, 0, output, "")
 
@@ -1064,11 +1222,18 @@ class OfflineWorld:
         kind = argv[argv.index("get") + 1]
         name = argv[argv.index("get") + 2]
         if kind == "nodes":
+            self.node_queries += 1
+            if self.missing_node_reads:
+                self.missing_node_reads -= 1
+                return json.dumps({"items": []})
+            ready = "False" if self.not_ready_reads else "True"
+            if self.not_ready_reads:
+                self.not_ready_reads -= 1
             return json.dumps({"items": [{
-                "metadata": {"name": self.infra.node_name(self.config), "uid": "node-" + str(generation)},
+                "metadata": {"name": self.node_name_override or self.infra.node_name(self.config), "uid": "node-" + str(generation)},
                 "status": {
-                    "conditions": [{"type": "Ready", "status": "True"}],
-                    "nodeInfo": {"machineID": self.identity["machine_id"], "bootID": self.identity["boot_id"], "systemUUID": self.vm_uuid},
+                    "conditions": [{"type": "Ready", "status": ready}],
+                    "nodeInfo": {"machineID": self.identity["machine_id"], "bootID": self.node_boot_override or self.identity["boot_id"], "systemUUID": self.vm_uuid},
                 },
             }]})
         if kind == "namespace":
@@ -1107,7 +1272,11 @@ class ChartContractTests(PrivateFilesTest):
                 "containers": [{
                     "name": "csi-driver", "image": "ghcr.io/democratic-csi/democratic-csi:v1.9.5",
                     "args": ["--csi-mode=node", "--csi-name=" + self.proof.DRIVER, "--csi-version=1.5.0"],
-                    "env": [{"name": "ISCSIADM_HOST_STRATEGY", "value": "chroot"}, {"name": "ISCSIADM_HOST_PATH", "value": "/usr/sbin/iscsiadm"}],
+                    "env": [
+                        {"name": "FILESYSTEM_TYPE_DETECTION_STRATEGY", "value": "blkid"},
+                        {"name": "ISCSIADM_HOST_STRATEGY", "value": "chroot"},
+                        {"name": "ISCSIADM_HOST_PATH", "value": "/usr/sbin/iscsiadm"},
+                    ],
                     "volumeMounts": [
                         {"name": "host-dir", "mountPath": "/host", "mountPropagation": "Bidirectional"},
                         {"name": "kubelet-dir", "mountPath": "/var/lib/kubelet", "mountPropagation": "Bidirectional"},

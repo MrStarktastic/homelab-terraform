@@ -16,6 +16,7 @@
   "cloudinit_storage": "REQUIRED_CLOUD_INIT_STORAGE",
   "os_storage": "REQUIRED_DISPOSABLE_OS_STORAGE",
   "ansible_checkout": "/absolute/path/to/approved/ansible-checkout",
+  "ansible_runtime_dir": null,
   "proxmox_ca_file": null,
   "flannel_iface": "eth1",
   "nas": {
