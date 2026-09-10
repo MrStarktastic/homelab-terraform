@@ -262,10 +262,15 @@ ext4 image stages without invoking a formatter. The real upstream manual-PV
 contract also requires `volumeAttributes.provisioner_driver: node-manual`,
 which is included in both generations' identical binding declarations.
 
-The no-create guard does not claim a general block-device write lock: normal
-upstream mounting/resizing of an already formatted filesystem remains its
-behavior. The canary uses the whole, unpartitioned ext4 zvol prepared for this
-fixture; it does not substitute raw-block tests or vendor modifications.
+The no-create guard is **no-format**, not a bit-for-bit raw-device write lock.
+For partitioned devices, upstream expands the selected partition **before**
+filesystem detection; after staging an existing ext4 filesystem it mounts and
+attempts to resize it. This ordinary filesystem/partition metadata behavior is
+not disabled by `-n`. The canary uses the whole, unpartitioned ext4 zvol prepared
+for this fixture, and the staging regression models zero partitions. Recovery
+must not reinitialize storage, erase retained data or create a new database;
+the initial and recovery PV/PVC binding identities remain the same. No mount
+policy changes, raw-block substitutions or vendor modifications are made.
 
 ### Repository merge guard
 
