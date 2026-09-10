@@ -75,6 +75,14 @@ python:3.13-slim@sha256:cc9dffa47c8294ba9bb795a8dfaeb7b76f2b30acade2c52a461a2999
   existing pool/portal settings, and a routed iSCSI data plane. NAS service
   startup is refused unless separately opted into with `allow_service_start`.
 
+**Serialize initial NAS provisioning across all fixtures and operators using
+the same NAS.** CHAP auth-tag allocation is not a server-side atomic
+reservation. The caller's local, per-fixture lock does not serialize different
+fixtures or operator machines. Shared-tag conflicts fail closed; they never
+authorize reusing, modifying or deleting another fixture's authentication
+record. Stop and review any conflict while retaining the private ownership
+state and marked NAS objects.
+
 The Ansible invocation uses an explicit JSON inventory with one host in
 `iscsi_canary` and `masters`. Inputs are `canary_fixture_id`,
 `canary_node_name`, `canary_iscsi_iqn`, absolute `canary_state_dir`,
@@ -100,6 +108,14 @@ The example intentionally contains no runnable VM ID/IP defaults or secrets.
 Use absolute, canonical paths without whitespace or symlinks. The SSH private
 key and operator JSON must be operator-owned, mode 0600 or stricter.
 `fixture_id` is 1–32 lowercase letters/digits/interior hyphens.
+
+`nas.url` must be an **HTTPS origin**, for example
+`https://nas.example.invalid` or `https://nas.example.invalid:443`.
+Do not append `/api/v2.0` or another path; the NAS module builds API paths itself.
+This differs from `PM_API_URL`, which requires the `/api2/json` suffix.
+The NAS ownership JSON at `.state/<fixture_id>/nas.json` must remain
+operator-owned and mode **0600**. It contains CHAP values and is never a public
+artifact.
 
 Supply credentials from your local secret manager as environment inputs:
 
